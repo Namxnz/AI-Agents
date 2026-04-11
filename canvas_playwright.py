@@ -174,9 +174,8 @@ def verify_session(playwright) -> bool:
 
 def api_get_via_browser(page, endpoint: str) -> list | dict:
     """
-    Make Canvas API calls through the authenticated Playwright browser page.
-    This avoids all cookie/auth issues — the browser session is already logged in.
-    Handles pagination automatically via the Link header.
+    Make Canvas API calls using Playwright's request context.
+    page.request uses the browser's cookie jar directly — no CORS, no fetch blocks.
     """
     base = f"{CANVAS_API_URL}/api/v1"
     url  = f"{base}{endpoint}"
@@ -188,31 +187,24 @@ def api_get_via_browser(page, endpoint: str) -> list | dict:
     results = []
 
     while url:
-        # Use page.evaluate to make a fetch() call from inside the browser
-        response = page.evaluate(f"""
-            async () => {{
-                const resp = await fetch({json.dumps(url)}, {{
-                    credentials: "include",
-                    headers: {{ "Accept": "application/json" }}
-                }});
-                const link = resp.headers.get("Link") || "";
-                const data = await resp.json();
-                return {{ data, link, status: resp.status }};
-            }}
-        """)
+        resp = page.request.get(
+            url,
+            headers={"Accept": "application/json"}
+        )
 
-        if response["status"] != 200:
-            raise Exception(f"API error {response['status']} for {url}")
+        if not resp.ok:
+            raise Exception(f"API error {resp.status} for {url}")
 
-        data = response["data"]
+        data = resp.json()
+
         if isinstance(data, list):
             results.extend(data)
         else:
             return data  # single object
 
-        # Follow pagination
+        # Follow Canvas Link-header pagination
         url  = None
-        link = response.get("link", "")
+        link = resp.headers.get("link", "")
         for part in link.split(","):
             if 'rel="next"' in part:
                 url = part.split(";")[0].strip().strip("<>")
@@ -260,24 +252,22 @@ def download_file_via_browser(page, file_url: str,
         return filepath
 
     try:
-        # Step 1: resolve Canvas file metadata via browser fetch (authenticated)
-        meta = page.evaluate(f"""
-            async () => {{
-                const resp = await fetch({json.dumps(file_url)}, {{
-                    credentials: "include",
-                    headers: {{ "Accept": "application/json" }}
-                }});
-                return await resp.json();
-            }}
-        """)
+        # Step 1: resolve Canvas file metadata using browser request context
+        meta_resp = page.request.get(
+            file_url,
+            headers={"Accept": "application/json"}
+        )
+        if not meta_resp.ok:
+            print(f"      ✗  Could not fetch file metadata: {meta_resp.status}")
+            return None
+        meta = meta_resp.json()
 
         download_url = meta.get("url")  # pre-signed S3 URL (no auth needed)
         if not download_url:
-            # Try url field directly or filename fallback
             print(f"      ✗  No download URL for: {filename}")
             return None
 
-        # Step 2: stream-download from S3 (public pre-signed URL, no cookies needed)
+        # Step 2: stream-download from S3 (public pre-signed URL)
         with requests.get(download_url, stream=True, timeout=60) as r:
             r.raise_for_status()
             with open(filepath, "wb") as f_out:
