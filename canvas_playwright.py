@@ -172,25 +172,40 @@ def verify_session(playwright) -> bool:
 
 # ─── Canvas data fetching (via API using session cookies) ─────────────────────
 
+def get_csrf_token(page) -> str:
+    """Extract the CSRF token Canvas stores in a cookie."""
+    cookies = page.context.cookies()
+    for c in cookies:
+        if c["name"] == "_csrf_token":
+            import urllib.parse
+            return urllib.parse.unquote(c["value"])
+    return ""
+
+
 def api_get_via_browser(page, endpoint: str) -> list | dict:
     """
-    Make Canvas API calls using Playwright's request context.
-    page.request uses the browser's cookie jar directly — no CORS, no fetch blocks.
+    Make Canvas API calls using Playwright's request context with CSRF token.
+    Canvas requires both the session cookie AND X-CSRF-Token header.
     """
-    base = f"{CANVAS_API_URL}/api/v1"
-    url  = f"{base}{endpoint}"
+    base  = f"{CANVAS_API_URL}/api/v1"
+    url   = f"{base}{endpoint}"
     if "?" in url:
         url += "&per_page=100"
     else:
         url += "?per_page=100"
 
+    csrf  = get_csrf_token(page)
+    hdrs  = {
+        "Accept": "application/json",
+        "X-CSRF-Token": csrf,
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": CANVAS_API_URL,
+    }
+
     results = []
 
     while url:
-        resp = page.request.get(
-            url,
-            headers={"Accept": "application/json"}
-        )
+        resp = page.request.get(url, headers=hdrs)
 
         if not resp.ok:
             raise Exception(f"API error {resp.status} for {url}")
@@ -253,9 +268,15 @@ def download_file_via_browser(page, file_url: str,
 
     try:
         # Step 1: resolve Canvas file metadata using browser request context
+        csrf = get_csrf_token(page)
         meta_resp = page.request.get(
             file_url,
-            headers={"Accept": "application/json"}
+            headers={
+                "Accept": "application/json",
+                "X-CSRF-Token": csrf,
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": CANVAS_API_URL,
+            }
         )
         if not meta_resp.ok:
             print(f"      ✗  Could not fetch file metadata: {meta_resp.status}")
