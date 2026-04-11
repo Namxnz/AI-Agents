@@ -172,49 +172,48 @@ def verify_session(playwright) -> bool:
 
 # ─── Canvas data fetching (via API using session cookies) ─────────────────────
 
-def get_cookies_dict(playwright) -> dict:
+def api_get_via_browser(page, endpoint: str) -> list | dict:
     """
-    Extract cookies from the saved session.
-    JHU Canvas uses both canvas.jhu.edu and jhu.instructure.com — collect
-    cookies from all Canvas-related domains so API calls are authenticated.
+    Make Canvas API calls through the authenticated Playwright browser page.
+    This avoids all cookie/auth issues — the browser session is already logged in.
+    Handles pagination automatically via the Link header.
     """
-    state = json.loads(SESSION_FILE.read_text())
-    valid_domains = ("canvas.jhu.edu", "jhu.instructure.com", "instructure.com")
-    cookies = {}
-    for c in state.get("cookies", []):
-        domain = c.get("domain", "")
-        if any(d in domain for d in valid_domains):
-            cookies[c["name"]] = c["value"]
+    base = f"{CANVAS_API_URL}/api/v1"
+    url  = f"{base}{endpoint}"
+    if "?" in url:
+        url += "&per_page=100"
+    else:
+        url += "?per_page=100"
 
-    # Fallback: if very few cookies found, use all of them
-    if len(cookies) < 3:
-        print(f"  Warning: only {len(cookies)} domain-matched cookies found, using all cookies.")
-        cookies = {c["name"]: c["value"] for c in state.get("cookies", [])}
-
-    print(f"  Using {len(cookies)} session cookies for API requests.")
-    return cookies
-
-
-def api_get(endpoint: str, cookies: dict) -> list | dict:
-    """Canvas API GET with pagination, using session cookies for auth."""
-    url     = f"{CANVAS_API_URL}/api/v1{endpoint}"
-    params  = {"per_page": 100}
     results = []
 
     while url:
-        resp = requests.get(url, cookies=cookies, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+        # Use page.evaluate to make a fetch() call from inside the browser
+        response = page.evaluate(f"""
+            async () => {{
+                const resp = await fetch({json.dumps(url)}, {{
+                    credentials: "include",
+                    headers: {{ "Accept": "application/json" }}
+                }});
+                const link = resp.headers.get("Link") || "";
+                const data = await resp.json();
+                return {{ data, link, status: resp.status }};
+            }}
+        """)
 
+        if response["status"] != 200:
+            raise Exception(f"API error {response['status']} for {url}")
+
+        data = response["data"]
         if isinstance(data, list):
             results.extend(data)
         else:
-            return data
+            return data  # single object
 
-        # Follow Canvas Link-header pagination
-        url    = None
-        params = {}
-        for part in resp.headers.get("Link", "").split(","):
+        # Follow pagination
+        url  = None
+        link = response.get("link", "")
+        for part in link.split(","):
             if 'rel="next"' in part:
                 url = part.split(";")[0].strip().strip("<>")
                 break
@@ -222,31 +221,31 @@ def api_get(endpoint: str, cookies: dict) -> list | dict:
     return results
 
 
-def get_courses(cookies: dict) -> list[dict]:
-    courses = api_get("/courses?enrollment_state=active&include[]=term", cookies)
+def get_courses(page) -> list[dict]:
+    courses = api_get_via_browser(page, "/courses?enrollment_state=active&include[]=term")
     return [c for c in courses if c.get("name") and not c.get("access_restricted_by_date")]
 
 
-def get_modules(course_id: int, cookies: dict) -> list[dict]:
-    return api_get(f"/courses/{course_id}/modules", cookies)
+def get_modules(course_id: int, page) -> list[dict]:
+    return api_get_via_browser(page, f"/courses/{course_id}/modules")
 
 
-def get_module_items(course_id: int, module_id: int, cookies: dict) -> list[dict]:
-    return api_get(f"/courses/{course_id}/modules/{module_id}/items", cookies)
+def get_module_items(course_id: int, module_id: int, page) -> list[dict]:
+    return api_get_via_browser(page, f"/courses/{course_id}/modules/{module_id}/items")
 
 
-def get_assignments(course_id: int, cookies: dict) -> list[dict]:
-    return api_get(f"/courses/{course_id}/assignments?order_by=due_at", cookies)
+def get_assignments(course_id: int, page) -> list[dict]:
+    return api_get_via_browser(page, f"/courses/{course_id}/assignments?order_by=due_at")
 
 
 # ─── File downloader ───────────────────────────────────────────────────────────
 
-def download_file_via_browser(playwright, cookies: dict, file_url: str,
+def download_file_via_browser(page, file_url: str,
                                dest: Path, filename: str) -> Path | None:
     """
-    Download a Canvas file using the browser session.
-    Canvas files need an authenticated redirect to S3 — we resolve the
-    real download URL via the API, then stream it with requests + cookies.
+    Download a Canvas file using the authenticated browser page.
+    Uses browser fetch() to get the pre-signed S3 URL, then streams
+    the actual file with requests (S3 URLs need no auth).
     """
     ext = Path(filename).suffix.lower()
     if ext in SKIP_EXTENSIONS:
@@ -261,23 +260,29 @@ def download_file_via_browser(playwright, cookies: dict, file_url: str,
         return filepath
 
     try:
-        # Step 1: resolve the Canvas file metadata to get the pre-signed S3 URL
-        meta_resp = requests.get(file_url, cookies=cookies, timeout=15,
-                                 allow_redirects=True)
-        meta_resp.raise_for_status()
-        meta = meta_resp.json()
-        download_url = meta.get("url")  # pre-signed S3 URL (no auth needed)
+        # Step 1: resolve Canvas file metadata via browser fetch (authenticated)
+        meta = page.evaluate(f"""
+            async () => {{
+                const resp = await fetch({json.dumps(file_url)}, {{
+                    credentials: "include",
+                    headers: {{ "Accept": "application/json" }}
+                }});
+                return await resp.json();
+            }}
+        """)
 
+        download_url = meta.get("url")  # pre-signed S3 URL (no auth needed)
         if not download_url:
+            # Try url field directly or filename fallback
             print(f"      ✗  No download URL for: {filename}")
             return None
 
-        # Step 2: stream-download from S3
+        # Step 2: stream-download from S3 (public pre-signed URL, no cookies needed)
         with requests.get(download_url, stream=True, timeout=60) as r:
             r.raise_for_status()
-            with open(filepath, "wb") as f:
+            with open(filepath, "wb") as f_out:
                 for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                    f_out.write(chunk)
 
         print(f"      ↓  Downloaded: {filename}")
         return filepath
@@ -399,10 +404,10 @@ def write_index(course_dir: Path, course: dict, modules_data: list[dict],
 
 # ─── Module processor ──────────────────────────────────────────────────────────
 
-def process_module(playwright, cookies: dict, course_id: int,
+def process_module(page, course_id: int,
                    module: dict, course_dir: Path) -> tuple[dict, list[Path]]:
     print(f"\n   Module: {module['name']}")
-    items      = get_module_items(course_id, module["id"], cookies)
+    items      = get_module_items(course_id, module["id"], page)
     module     = {**module, "items": items}
     downloaded = []
     mod_dir    = course_dir / sanitise(module["name"])
@@ -417,7 +422,7 @@ def process_module(playwright, cookies: dict, course_id: int,
                 continue
             filename = title
             path = download_file_via_browser(
-                playwright, cookies, file_api_url, mod_dir, filename
+                page, file_api_url, mod_dir, filename
             )
             if path:
                 downloaded.append(path)
@@ -427,7 +432,7 @@ def process_module(playwright, cookies: dict, course_id: int,
             if assignment_url:
                 try:
                     endpoint = assignment_url.replace(f"{CANVAS_API_URL}/api/v1", "")
-                    a = api_get(endpoint, cookies)
+                    a = api_get_via_browser(page, endpoint)
                     stub = mod_dir / sanitise(f"{title}.md")
                     mod_dir.mkdir(parents=True, exist_ok=True)
                     stub.write_text(
@@ -476,14 +481,24 @@ def run(force_login=False, list_only=False):
             else:
                 print("  Session valid ✓")
 
-        cookies = get_cookies_dict(pw)
+        # ── Open a persistent background browser page for all API calls ────────
+        opera_exists = Path(OPERA_PATH).exists()
+        launch_kwargs = {"headless": True}
+        if opera_exists:
+            launch_kwargs["executable_path"] = OPERA_PATH
+        bg_browser = pw.chromium.launch(**launch_kwargs)
+        bg_context = bg_browser.new_context(storage_state=str(SESSION_FILE))
+        page = bg_context.new_page()
+        page.goto(f"{CANVAS_API_URL}/", timeout=NAV_TIMEOUT)
+        page.wait_for_timeout(1500)
 
         # ── Course list ───────────────────────────────────────────────────────
         print("\n  Fetching your courses...")
-        courses = get_courses(cookies)
+        courses = get_courses(page)
 
         if not courses:
             print("  No active courses found. Try --refresh to re-login.")
+            bg_browser.close()
             return
 
         if list_only:
@@ -491,6 +506,7 @@ def run(force_login=False, list_only=False):
             for c in courses:
                 term = c.get("term", {}).get("name", "")
                 print(f"  {c['id']:>10}  {c['name']:<55} {term}")
+            bg_browser.close()
             return
 
         # ── Pick course ───────────────────────────────────────────────────────
@@ -499,16 +515,17 @@ def run(force_login=False, list_only=False):
 
         # ── Pick modules ──────────────────────────────────────────────────────
         print("  Fetching modules...")
-        modules = get_modules(course["id"], cookies)
+        modules = get_modules(course["id"], page)
         selected = pick_modules(modules)
 
         if not selected:
             print("  Nothing selected.")
+            bg_browser.close()
             return
 
         # ── Assignments ───────────────────────────────────────────────────────
         print("  Fetching assignments...")
-        assignments = get_assignments(course["id"], cookies)
+        assignments = get_assignments(course["id"], page)
 
         # ── Download ──────────────────────────────────────────────────────────
         course_dir      = OUTPUT_DIR / sanitise(course["name"])
@@ -517,7 +534,7 @@ def run(force_login=False, list_only=False):
 
         for mod in selected:
             enriched, files = process_module(
-                pw, cookies, course["id"], mod, course_dir
+                page, course["id"], mod, course_dir
             )
             enriched_mods.append(enriched)
             all_downloaded.extend(files)
@@ -533,6 +550,7 @@ def run(force_login=False, list_only=False):
         print(f"  Saved to         : {course_dir.resolve()}")
         print(f"  Obsidian index   : {index.resolve()}")
         print()
+        bg_browser.close()
         print("  Next step — open your Claude Project and paste:")
         print()
         print('  "Read all attached files. Explain the key concepts,')
