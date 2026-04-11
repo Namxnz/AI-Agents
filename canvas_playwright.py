@@ -481,16 +481,19 @@ def run(force_login=False, list_only=False):
             else:
                 print("  Session valid ✓")
 
-        # ── Open a persistent background browser page for all API calls ────────
+        # ── Open a visible browser page reusing the saved session ──────────────
+        # Must be non-headless so Cloudflare doesn't block the requests
         opera_exists = Path(OPERA_PATH).exists()
-        launch_kwargs = {"headless": True}
+        launch_kwargs = {"headless": False}
         if opera_exists:
             launch_kwargs["executable_path"] = OPERA_PATH
         bg_browser = pw.chromium.launch(**launch_kwargs)
         bg_context = bg_browser.new_context(storage_state=str(SESSION_FILE))
         page = bg_context.new_page()
+        # Navigate to Canvas so cookies are active for fetch() calls
         page.goto(f"{CANVAS_API_URL}/", timeout=NAV_TIMEOUT)
-        page.wait_for_timeout(1500)
+        page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+        print("  Browser ready. (You can minimise it — do not close it)")
 
         # ── Course list ───────────────────────────────────────────────────────
         print("\n  Fetching your courses...")
