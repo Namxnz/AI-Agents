@@ -35,6 +35,12 @@ CANVAS_URL   = "https://canvas.jhu.edu"
 OUTPUT_DIR   = Path(os.getenv("STUDY_DIR",   "./study_materials"))
 SESSION_FILE = Path(os.getenv("SESSION_FILE", "./canvas_session.json"))
 
+# Opera executable path on macOS — auto-detected, or override in .env
+OPERA_PATH = os.getenv(
+    "OPERA_PATH",
+    "/Applications/Opera.app/Contents/MacOS/Opera"
+)
+
 SKIP_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".zip"}
 LOGIN_TIMEOUT   = 120_000   # 2 min for manual SSO + MFA
 NAV_TIMEOUT     = 30_000
@@ -84,15 +90,37 @@ def do_login(playwright) -> bool:
     print("  Complete your JHED login and Duo MFA as normal.")
     print("  The window will close automatically once you're in.\n")
 
-    browser = playwright.chromium.launch(headless=False, slow_mo=100)
+    # Use Opera if it exists, otherwise fall back to Playwright's Chromium
+    opera_exists = Path(OPERA_PATH).exists()
+    if opera_exists:
+        print(f"  Using Opera at: {OPERA_PATH}")
+        browser = playwright.chromium.launch(
+            headless=False,
+            slow_mo=100,
+            executable_path=OPERA_PATH
+        )
+    else:
+        print("  Opera not found — using built-in Chromium instead.")
+        print(f"  (Expected Opera at: {OPERA_PATH})")
+        browser = playwright.chromium.launch(headless=False, slow_mo=100)
+
     context = browser.new_context()
     page    = context.new_page()
 
-    page.goto(f"{CANVAS_URL}/login/saml", timeout=NAV_TIMEOUT)
+    # Go to Canvas homepage and click the JHU Login button
+    page.goto(f"{CANVAS_URL}/", timeout=NAV_TIMEOUT)
+    page.wait_for_timeout(2000)
+
+    # Click the "JHU Login" button if it's present on the page
+    try:
+        page.click("a:has-text('JHU Login')", timeout=8000)
+    except Exception:
+        # Button not found — may have already redirected, just continue
+        pass
 
     print("  Waiting for you to complete login", end="", flush=True)
 
-    # Wait until we land on the Canvas dashboard (URL no longer has /login)
+    # Wait until we land on the Canvas dashboard (URL contains /courses or /dashboard)
     try:
         page.wait_for_url(
             lambda url: "canvas.jhu.edu" in url and "/login" not in url,
@@ -113,8 +141,14 @@ def do_login(playwright) -> bool:
 
 def verify_session(playwright) -> bool:
     """Check if the saved session is still valid by loading the dashboard."""
-    browser, context = load_session(playwright, headless=True)
-    page = context.new_page()
+    opera_exists = Path(OPERA_PATH).exists()
+    launch_kwargs = {"headless": True}
+    if opera_exists:
+        launch_kwargs["executable_path"] = OPERA_PATH
+
+    browser = playwright.chromium.launch(**launch_kwargs)
+    context = browser.new_context(storage_state=str(SESSION_FILE))
+    page    = context.new_page()
     try:
         page.goto(f"{CANVAS_URL}/", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(2000)
