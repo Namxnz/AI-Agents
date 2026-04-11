@@ -31,7 +31,8 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 load_dotenv()
 
-CANVAS_URL   = "https://canvas.jhu.edu"
+CANVAS_URL      = "https://canvas.jhu.edu"
+CANVAS_API_URL  = "https://jhu.instructure.com"   # actual backend after SSO redirect
 OUTPUT_DIR   = Path(os.getenv("STUDY_DIR",   "./study_materials"))
 SESSION_FILE = Path(os.getenv("SESSION_FILE", "./canvas_session.json"))
 
@@ -120,10 +121,15 @@ def do_login(playwright) -> bool:
 
     print("  Waiting for you to complete login", end="", flush=True)
 
-    # Wait until we land on the Canvas dashboard (URL contains /courses or /dashboard)
+    # Wait until we land on the Canvas dashboard
+    # JHU Canvas may redirect to jhu.instructure.com — both are valid
     try:
         page.wait_for_url(
-            lambda url: "canvas.jhu.edu" in url and "/login" not in url,
+            lambda url: (
+                ("canvas.jhu.edu" in url or "jhu.instructure.com" in url)
+                and "/login" not in url
+                and "microsoftonline" not in url
+            ),
             timeout=LOGIN_TIMEOUT
         )
     except PWTimeout:
@@ -153,7 +159,10 @@ def verify_session(playwright) -> bool:
         page.goto(f"{CANVAS_URL}/", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(2000)
         # If we're redirected to /login, session has expired
-        is_valid = "/login" not in page.url
+        is_valid = (
+            "/login" not in page.url
+            and "microsoftonline" not in page.url
+        )
         return is_valid
     except Exception:
         return False
@@ -171,7 +180,7 @@ def get_cookies_dict(playwright) -> dict:
 
 def api_get(endpoint: str, cookies: dict) -> list | dict:
     """Canvas API GET with pagination, using session cookies for auth."""
-    url     = f"{CANVAS_URL}/api/v1{endpoint}"
+    url     = f"{CANVAS_API_URL}/api/v1{endpoint}"
     params  = {"per_page": 100}
     results = []
 
@@ -308,7 +317,7 @@ def write_index(course_dir: Path, course: dict, modules_data: list[dict],
                 assignments: list[dict], downloaded: list[Path]) -> Path:
     today      = datetime.now().strftime("%Y-%m-%d")
     index_path = course_dir / "_index.md"
-    course_url = f"{CANVAS_URL}/courses/{course['id']}"
+    course_url = f"{CANVAS_API_URL}/courses/{course['id']}"
 
     lines = [
         f"# {course['name']}",
@@ -400,7 +409,7 @@ def process_module(playwright, cookies: dict, course_id: int,
             assignment_url = item.get("url", "")
             if assignment_url:
                 try:
-                    endpoint = assignment_url.replace(f"{CANVAS_URL}/api/v1", "")
+                    endpoint = assignment_url.replace(f"{CANVAS_API_URL}/api/v1", "")
                     a = api_get(endpoint, cookies)
                     stub = mod_dir / sanitise(f"{title}.md")
                     mod_dir.mkdir(parents=True, exist_ok=True)
