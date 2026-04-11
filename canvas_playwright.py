@@ -173,9 +173,26 @@ def verify_session(playwright) -> bool:
 # ─── Canvas data fetching (via API using session cookies) ─────────────────────
 
 def get_cookies_dict(playwright) -> dict:
-    """Extract cookies from the saved session as a requests-compatible dict."""
+    """
+    Extract cookies from the saved session.
+    JHU Canvas uses both canvas.jhu.edu and jhu.instructure.com — collect
+    cookies from all Canvas-related domains so API calls are authenticated.
+    """
     state = json.loads(SESSION_FILE.read_text())
-    return {c["name"]: c["value"] for c in state.get("cookies", [])}
+    valid_domains = ("canvas.jhu.edu", "jhu.instructure.com", "instructure.com")
+    cookies = {}
+    for c in state.get("cookies", []):
+        domain = c.get("domain", "")
+        if any(d in domain for d in valid_domains):
+            cookies[c["name"]] = c["value"]
+
+    # Fallback: if very few cookies found, use all of them
+    if len(cookies) < 3:
+        print(f"  Warning: only {len(cookies)} domain-matched cookies found, using all cookies.")
+        cookies = {c["name"]: c["value"] for c in state.get("cookies", [])}
+
+    print(f"  Using {len(cookies)} session cookies for API requests.")
+    return cookies
 
 
 def api_get(endpoint: str, cookies: dict) -> list | dict:
