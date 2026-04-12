@@ -191,8 +191,23 @@ def api_get_via_browser(page, endpoint: str) -> list | dict:
         # Navigate the browser to the API endpoint — it returns raw JSON
         page.goto(url, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
 
-        # Grab the raw JSON text from the page body
-        raw = page.inner_text("body")
+        # Get raw text and parse — add debug to see what we get
+        body_text = page.inner_text("body").strip()
+        # Opera/Chrome JSON viewer puts JSON in <pre> inside body
+        # But inner_text("body") gets ALL text including pre contents
+        # Try to find the JSON start character
+        json_start = body_text.find("[")
+        json_start_obj = body_text.find("{")
+        if json_start == -1 or (json_start_obj != -1 and json_start_obj < json_start):
+            json_start = json_start_obj
+        if json_start == -1:
+            print(f"  [debug] Could not find JSON in body. First 200 chars: {body_text[:200]}")
+            raise Exception("No JSON found in API response")
+        raw = body_text[json_start:]
+        # Find matching end bracket
+        end_char = "]" if raw[0] == "[" else "}"
+        json_end = raw.rfind(end_char)
+        raw = raw[:json_end+1]
         data = json.loads(raw)
 
         if isinstance(data, list):
@@ -260,8 +275,11 @@ def download_file_via_browser(page, file_url: str,
     try:
         # Navigate browser to the file API URL to get metadata (JSON response)
         page.goto(file_url, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-        raw  = page.inner_text("body")
-        meta = json.loads(raw)
+        try:
+            raw = page.inner_text("pre")
+        except Exception:
+            raw = page.inner_text("body")
+        meta = json.loads(raw.strip())
 
         download_url = meta.get("url")  # pre-signed S3 URL
         if not download_url:
