@@ -243,11 +243,11 @@ def main() -> None:
     parser.add_argument("topic", help='Research topic, e.g. "AI safety in 2025"')
     parser.add_argument("--urls", nargs="*", default=[], metavar="URL", help="URLs to fetch")
     parser.add_argument("--pdfs", nargs="*", default=[], metavar="FILE", help="PDF files to read")
-    parser.add_argument("--output", default="report.md", help="Output markdown file (default: report.md)")
+    parser.add_argument("--output", default=None, help="Save a local markdown file (optional)")
     parser.add_argument(
         "--google-doc",
         action="store_true",
-        help="Also publish the report as a Google Doc",
+        help="Publish the report as a Google Doc",
     )
     parser.add_argument(
         "--credentials",
@@ -269,12 +269,13 @@ def main() -> None:
     if not report.strip():
         print("\nWarning: the agent returned an empty report.", file=sys.stderr)
 
-    # Save markdown
-    output_path = Path(args.output)
-    output_path.write_text(report, encoding="utf-8")
-    print(f"\nReport saved to: {output_path.resolve()}")
+    # Save local markdown only if --output is explicitly provided
+    if args.output:
+        output_path = Path(args.output)
+        output_path.write_text(report, encoding="utf-8")
+        print(f"\nReport saved to: {output_path.resolve()}")
 
-    # Optionally create Google Doc
+    # Create Google Doc
     if args.google_doc:
         try:
             from google_docs import create_google_doc  # type: ignore
