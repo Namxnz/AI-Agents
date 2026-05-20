@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd schedule for vn30_monitor.py
+  Runs every weekday (Mon=1 … Fri=5) at 16:00 local time.
+
+  ASSUMPTION: your Mac's local timezone is Asia/Ho_Chi_Minh (ICT, UTC+7).
+  If you're outside Vietnam, change the Hour field below to your local
+  equivalent of 16:00 ICT (HOSE closes at 15:00 ICT).
+
+  Adjust the Python path below if your venv is elsewhere — currently
+  points at the shared /Users/mac/Projects/.venv that you've been using.
+
+  Install:
+      cp com.nam.vn30monitor.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.nam.vn30monitor.plist
+  Test once:
+      launchctl start com.nam.vn30monitor
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nam.vn30monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mac/Projects/.venv/bin/python</string>
+        <string>/Users/mac/Projects/AI-Agents/stock_agent/vn30_monitor.py</string>
+        <string>monitor</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mac/Projects/AI-Agents/stock_agent</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mac/Projects/AI-Agents/stock_agent/reports/cron.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mac/Projects/AI-Agents/stock_agent/reports/cron.err</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
