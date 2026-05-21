@@ -24,7 +24,10 @@ import logging
 import os
 import smtplib
 import sys
+import threading
+import time
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -91,6 +94,21 @@ SMTP_USER = os.getenv("SMTP_USER", "")            # e.g. namxnz@gmail.com
 SMTP_PASS = os.getenv("SMTP_PASS", "")            # Gmail App Password (16 chars)
 EMAIL_TO  = os.getenv("EMAIL_TO", "namxnz@gmail.com")
 
+# --- vnstock rate limiting --------------------------------------------------
+# vnstock's free "Guest" tier allows only ~20 HTTP requests/minute and HARD-
+# KILLS the process when you exceed it (no catchable exception). So we pace
+# requests ourselves and stay safely under the cap.
+#
+# VNSTOCK_MAX_RPM = the per-minute HTTP-request budget the limiter enforces.
+#   • Guest (no key):        keep at 16  (default — safe under the 20 cap)
+#   • Community (free key):  you can raise this to ~50  (60/min cap)
+#   Register a free key at https://vnstocks.com/login, then set VNSTOCK_MAX_RPM
+#   in your .env. A 30-ticker screen takes ~7 min on Guest, ~2 min on Community.
+VNSTOCK_MAX_RPM = int(os.getenv("VNSTOCK_MAX_RPM", "16"))
+# Rough number of underlying HTTP requests one DataFetcher method triggers.
+# Each fetch call reserves this many slots in the budget (conservative).
+REQUESTS_PER_CALL = 2
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -103,6 +121,48 @@ log = logging.getLogger("vn30")
 
 # Vietnam local timezone (UTC+7), no DST.
 ICT = timezone(timedelta(hours=7))
+
+# =============================================================================
+# Rate limiter — keep us under vnstock's per-minute request cap
+# =============================================================================
+
+class RateLimiter:
+    """Sliding-window limiter. Blocks until a request slot is free.
+
+    vnstock's guest tier terminates the whole process on a rate-limit breach,
+    so there is nothing to recover from after the fact — we MUST stay under
+    the cap proactively. This limiter records a timestamp per request and
+    sleeps whenever the trailing 60-second window is full.
+    """
+
+    def __init__(self, max_per_period: int, period: float = 60.0):
+        self.max_per_period = max(1, int(max_per_period))
+        self.period = float(period)
+        self._stamps: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self, weight: int = 1) -> None:
+        """Reserve `weight` request slots, blocking (sleeping) if needed."""
+        weight = max(1, min(int(weight), self.max_per_period))
+        with self._lock:
+            while True:
+                now = time.monotonic()
+                # Drop timestamps that have aged out of the window.
+                while self._stamps and now - self._stamps[0] >= self.period:
+                    self._stamps.popleft()
+                if len(self._stamps) + weight <= self.max_per_period:
+                    self._stamps.extend([now] * weight)
+                    return
+                # Window is full — wait until the oldest stamp expires.
+                wait = self.period - (now - self._stamps[0]) + 0.5
+                log.info("⏳ Rate-limit guard: pausing %.0fs to stay under "
+                         "%d req/min …", wait, self.max_per_period)
+                time.sleep(max(0.5, wait))
+
+
+# One shared limiter for every vnstock call in the process.
+_LIMITER = RateLimiter(VNSTOCK_MAX_RPM)
+
 
 # =============================================================================
 # Data layer — thin wrapper around vnstock
@@ -124,17 +184,30 @@ class DataFetcher:
                 "    pip install -U vnstock python-dotenv pandas numpy\n"
                 f"Original error: {e}"
             )
-        self._Vnstock = Vnstock
+        # One Vnstock() instance for the whole run, so device registration
+        # and other one-time setup happen once instead of per ticker.
+        self._vn = Vnstock()
         self._source = source
+        self._stock_cache: dict = {}
 
     def _stock(self, symbol: str):
-        return self._Vnstock().stock(symbol=symbol, source=self._source)
+        """Cached stock client per ticker.
+
+        Repeated calls for the same symbol (e.g. price + ratios in `screen`)
+        reuse one object instead of re-creating it, which saves requests.
+        """
+        if symbol not in self._stock_cache:
+            self._stock_cache[symbol] = self._vn.stock(
+                symbol=symbol, source=self._source
+            )
+        return self._stock_cache[symbol]
 
     # ----- Prices -----
     def price_history(self, symbol: str, lookback_days: int = 260) -> pd.DataFrame:
         end = datetime.now(ICT).date()
         start = end - timedelta(days=int(lookback_days * 1.6))  # pad for weekends/holidays
         try:
+            _LIMITER.acquire(REQUESTS_PER_CALL)
             df = self._stock(symbol).quote.history(
                 start=str(start), end=str(end), interval="1D"
             )
@@ -152,6 +225,7 @@ class DataFetcher:
     # ----- Fundamentals -----
     def financial_ratios(self, symbol: str) -> pd.DataFrame:
         try:
+            _LIMITER.acquire(REQUESTS_PER_CALL)
             return self._stock(symbol).finance.ratio(period="year", lang="en")
         except Exception as e:
             log.warning("financial_ratios(%s) failed: %s", symbol, e)
@@ -159,6 +233,7 @@ class DataFetcher:
 
     def company_overview(self, symbol: str) -> dict:
         try:
+            _LIMITER.acquire(REQUESTS_PER_CALL)
             df = self._stock(symbol).company.overview()
             if df is None or df.empty:
                 return {}
@@ -171,6 +246,7 @@ class DataFetcher:
     # ----- News -----
     def company_news(self, symbol: str) -> pd.DataFrame:
         try:
+            _LIMITER.acquire(REQUESTS_PER_CALL)
             df = self._stock(symbol).company.news()
             if df is None or df.empty:
                 return pd.DataFrame()
@@ -194,11 +270,13 @@ class DataFetcher:
             for attr in ("foreign_trading", "trading_stats"):
                 fn = getattr(stock.trading, attr, None)
                 if callable(fn):
+                    _LIMITER.acquire(REQUESTS_PER_CALL)
                     df = fn()
                     if isinstance(df, pd.DataFrame) and not df.empty:
                         df = df.rename(columns={c: c.lower() for c in df.columns})
                         return df.tail(lookback_days)
             # Fallback: price board snapshot today only
+            _LIMITER.acquire(REQUESTS_PER_CALL)
             df = stock.trading.price_board(symbols_list=[symbol])
             return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
         except Exception as e:
@@ -629,6 +707,10 @@ def _load_dotenv():
 def cmd_screen(args) -> int:
     fetcher = DataFetcher()
     universe = SCREEN_UNIVERSE if not args.symbols else args.symbols
+    est_min = len(universe) * 2 * REQUESTS_PER_CALL / max(1, VNSTOCK_MAX_RPM)
+    log.info("Screening %d tickers, throttled to %d req/min "
+             "(~%.0f min). The script pauses itself near the limit — "
+             "let it run.", len(universe), VNSTOCK_MAX_RPM, est_min)
     df = screen(fetcher, universe)
     if df.empty:
         log.error("Screening produced no data.")
@@ -648,6 +730,10 @@ def cmd_screen(args) -> int:
 def cmd_monitor(args) -> int:
     fetcher = DataFetcher()
     watch = WATCHLIST if not args.symbols else args.symbols
+    est_min = len(watch) * 4 * REQUESTS_PER_CALL / max(1, VNSTOCK_MAX_RPM)
+    log.info("Monitoring %d tickers, throttled to %d req/min "
+             "(~%.0f min). The script pauses itself near the limit — "
+             "let it run.", len(watch), VNSTOCK_MAX_RPM, est_min)
     payload = monitor(fetcher, watch)
     html = build_html_report(payload)
     path = save_report(html)

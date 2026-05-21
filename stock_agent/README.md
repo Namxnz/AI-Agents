@@ -48,6 +48,29 @@ without opening every email.
 Trim `WATCHLIST` in `vn30_monitor.py` to your held names once you've
 committed capital — fewer tickers = less noise.
 
+## Rate limits & speed
+
+vnstock's free **Guest** tier allows only ~20 API requests per minute and
+**terminates the process** if you exceed it. The script throttles itself to
+stay under that cap, so a full 30-ticker run is paced, not instant:
+
+- `screen`  — roughly **7 minutes** on the Guest tier
+- `monitor` — roughly **10 minutes** on the Guest tier
+
+You'll see `⏳ Rate-limit guard: pausing …` lines while it waits — that's
+normal, just let it run. To go faster, register a **free Community API key**
+at https://vnstocks.com/login and raise the budget in `.env`:
+
+```
+VNSTOCK_MAX_RPM=50      # default is 16 (Guest-safe)
+```
+
+That cuts a screen run to ~2 minutes. For a quick test, screen a few names
+at a time: `python vn30_monitor.py screen --symbols FPT MWG VCB`.
+
+The deprecation banners and "INSIDERS PROGRAM" ads vnstock prints are
+harmless noise — ignore them.
+
 ## Scheduling
 
 HOSE closes at 15:00 ICT. The launchd template runs the script daily at
