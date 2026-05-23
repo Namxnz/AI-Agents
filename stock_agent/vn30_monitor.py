@@ -293,9 +293,9 @@ def sma(series: pd.Series, n: int) -> pd.Series:
 
 def rsi(series: pd.Series, n: int = 14) -> pd.Series:
     delta = series.diff()
-    up = delta.clip(lower=0).rolling(n).mean()
-    down = -delta.clip(upper=0).rolling(n).mean()
-    rs = up / down.replace(0, np.nan)
+    up   = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    down = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    rs   = up / down.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 def pct_return(series: pd.Series, n: int) -> float:
@@ -317,6 +317,7 @@ class ScreenRow:
     roe: float = np.nan
     roa: float = np.nan
     de: float = np.nan          # debt / equity
+    net_margin: float = np.nan
     eps_growth_3y: float = np.nan
     rev_growth_3y: float = np.nan
     mom_6m: float = np.nan
@@ -326,9 +327,37 @@ class ScreenRow:
 
 
 def _first_present(d: dict, keys: Iterable[str], default=np.nan):
+    """Match a value from dict d.
+
+    Tries three passes so we handle any vnstock column-naming convention:
+      1. Exact match (case-insensitive, after lowercasing both sides)
+      2. Normalised match — strip underscores from both key and column name
+         (e.g. "price_to_earning" matches "pricetoearning")
+      3. Substring match — the search key is contained in the column name
+         (e.g. "roe" matches "profitability_roe" or "annualroe")
+    """
+    d_lower = {k.lower(): v for k, v in d.items()}
+
+    # Pass 1: exact (lowercased)
     for k in keys:
-        if k in d and pd.notna(d[k]):
-            return d[k]
+        kl = k.lower()
+        if kl in d_lower and pd.notna(d_lower[kl]):
+            return d_lower[kl]
+
+    # Pass 2: strip underscores
+    d_norm = {k.replace("_", ""): v for k, v in d_lower.items()}
+    for k in keys:
+        kn = k.lower().replace("_", "")
+        if kn in d_norm and pd.notna(d_norm[kn]):
+            return d_norm[kn]
+
+    # Pass 3: substring
+    for k in keys:
+        kn = k.lower().replace("_", "")
+        for col, val in d_norm.items():
+            if kn in col and pd.notna(val):
+                return val
+
     return default
 
 
@@ -352,30 +381,104 @@ def screen(fetcher: DataFetcher, universe: list[str]) -> pd.DataFrame:
         # ----- Ratios -----
         ratios = fetcher.financial_ratios(sym)
         if not ratios.empty:
-            # vnstock returns ratios with MultiIndex columns in some versions.
-            # Flatten to plain dict using the most recent row.
             try:
+                # Flatten MultiIndex column names first.
                 if isinstance(ratios.columns, pd.MultiIndex):
-                    ratios.columns = ["_".join([str(x) for x in c if x]).lower()
-                                      for c in ratios.columns]
+                    raw_cols = ["_".join([str(x) for x in c if x]).lower()
+                                for c in ratios.columns]
                 else:
-                    ratios.columns = [str(c).lower() for c in ratios.columns]
-                latest = ratios.iloc[0].to_dict()
-            except Exception:
+                    raw_cols = [str(c).lower() for c in ratios.columns]
+
+                # ── raw diagnostic (first ticker only) ──────────────────────
+                if sym == universe[0]:
+                    log.info("RAW ratio shape=%s  cols=%s",
+                             ratios.shape, raw_cols)
+                    log.info("RAW ratio row[0]=%s", list(ratios.values[0]))
+
+                # ── vnstock 4.x long format ──────────────────────────────────
+                # Rows = metrics, columns include 'item_id' + year columns.
+                # Duplicate column names break pandas selection, so we use
+                # positional numpy access throughout.
+                long_id_col = next(
+                    (c for c in ("item_id", "item_en", "item")
+                     if c in raw_cols), None
+                )
+                year_positions = sorted(
+                    [(c, i) for i, c in enumerate(raw_cols)
+                     if str(c).lstrip("-").isdigit() and len(str(c)) == 4],
+                    reverse=True,   # most-recent year first
+                )
+
+                if long_id_col and year_positions:
+                    # Long format: build {metric_id: value} using numpy rows.
+                    id_pos = raw_cols.index(long_id_col)
+                    arr    = ratios.values   # shape (n_metrics, n_cols)
+
+                    # Find the column that holds the most recent year by
+                    # reading the 'ratioyearid' or 'year' row's actual values.
+                    # All columns may share the same pandas label ('2018') due
+                    # to a vnstock naming bug, so we scan the data directly.
+                    best_col_pos = year_positions[-1][1]  # default: last col
+                    best_year    = -1
+                    id_vals = {str(row[id_pos]).strip().lower(): row
+                               for row in arr
+                               if str(row[id_pos]).strip().lower()
+                               not in ("nan", "none", "")}
+                    for key in ("ratioyearid", "year"):
+                        if key in id_vals:
+                            yr_row = id_vals[key]
+                            for _, col_pos in year_positions:
+                                try:
+                                    y = int(float(str(yr_row[col_pos])))
+                                    if y > best_year:
+                                        best_year    = y
+                                        best_col_pos = col_pos
+                                except (ValueError, TypeError):
+                                    pass
+                            break
+
+                    latest = {}
+                    for row in arr:
+                        k = str(row[id_pos]).strip().lower()
+                        if k and k not in ("nan", "none", ""):
+                            latest[k] = row[best_col_pos]
+                    if sym == universe[0]:
+                        log.info("Long-format pivot: best_year=%s col=%s  "
+                                 "pe_ratio=%s  roe=%s  div_yield=%s",
+                                 best_year, best_col_pos,
+                                 latest.get("pe_ratio"), latest.get("roe"),
+                                 latest.get("dividend_yield"))
+
+                # ── vnstock 3.x wide format ──────────────────────────────────
+                # Rows = years (most-recent first), columns = metric names.
+                else:
+                    arr = ratios.values
+                    latest = {raw_cols[i]: arr[0, i] for i in range(len(raw_cols))}
+                    if sym == universe[0]:
+                        log.info("Wide-format keys=%s", list(latest.keys()))
+
+            except Exception as e:
+                log.warning("ratio parse error for %s: %s", sym, e)
                 latest = {}
 
-            r.pe  = _first_present(latest, ["pe", "price_to_earning", "valuation_pe"])
-            r.pb  = _first_present(latest, ["pb", "price_to_book", "valuation_pb"])
-            r.roe = _first_present(latest, ["roe", "profitability_roe"])
-            r.roa = _first_present(latest, ["roa", "profitability_roa"])
-            r.de  = _first_present(latest, ["debt_on_equity", "de", "leverage_de"])
+            # Exact names come from the 'Long-format pivot' diagnostic above.
+            r.pe  = _first_present(latest, ["pe_ratio",  "pe", "pricetoearning"])
+            r.pb  = _first_present(latest, ["pb_ratio",  "pb", "pricetobook"])
+            r.roe = _first_present(latest, ["roe"])
+            r.roa = _first_present(latest, ["roa"])
+            r.de  = _first_present(latest, ["debt_to_equity", "debtperequity",
+                                            "debtonequity", "de"])
+            r.net_margin = _first_present(latest, ["net_margin", "netmargin",
+                                                   "post_tax_profit_margin",
+                                                   "posttaxprofitmargin"])
             r.eps_growth_3y = _first_present(
-                latest, ["eps_growth_3yr", "growth_eps_3yr", "earning_growth"]
+                latest, ["eps_growth", "epschange", "epsgrowth", "earninggrowth"]
             )
             r.rev_growth_3y = _first_present(
-                latest, ["revenue_growth_3yr", "growth_revenue_3yr", "sale_growth"]
+                latest, ["loans_growth", "deposit_growth", "revenuegrowth",
+                         "salegrowth", "creditgrowth"]
             )
-            r.div_yield = _first_present(latest, ["dividend_yield", "div_yield"])
+            r.div_yield = _first_present(latest, ["dividend_yield", "dividendyield"])
 
         rows.append(r)
 
@@ -393,14 +496,14 @@ def screen(fetcher: DataFetcher, universe: list[str]) -> pd.DataFrame:
                         + z(df["pb"], lower_is_better=True).fillna(0)) / 2
     df["z_quality"]  = (z(df["roe"]).fillna(0)
                         + z(df["roa"]).fillna(0)
-                        + z(df["de"], lower_is_better=True).fillna(0)) / 3
-    df["z_growth"]   = (z(df["eps_growth_3y"]).fillna(0)
-                        + z(df["rev_growth_3y"]).fillna(0)) / 2
+                        + z(df["net_margin"]).fillna(0)
+                        + z(df["de"], lower_is_better=True).fillna(0)) / 4
     df["z_momentum"] = z(df["mom_6m"]).fillna(0)
 
-    df["score"] = (0.40 * df["z_value"]
-                   + 0.30 * df["z_quality"]
-                   + 0.20 * df["z_growth"]
+    # eps_growth_3y / rev_growth_3y are kept in the CSV for reference but
+    # excluded from scoring since vnstock's free tier doesn't provide them.
+    df["score"] = (0.50 * df["z_value"]
+                   + 0.40 * df["z_quality"]
                    + 0.10 * df["z_momentum"])
 
     return df.sort_values("score", ascending=False).reset_index(drop=True)
@@ -431,8 +534,8 @@ def technical_signals(prices: pd.DataFrame) -> dict:
         "sma200":       float(sma(close, 200).iloc[-1]) if len(close) >= 200 else np.nan,
         "rsi14":        float(rsi(close, 14).iloc[-1])  if len(close) >= 15  else np.nan,
     }
-    if not vol.empty and len(vol) >= 20:
-        avg_vol = float(vol.tail(20).mean())
+    if not vol.empty and len(vol) >= 21:
+        avg_vol = float(vol.iloc[-21:-1].mean())   # 20-day avg excluding today
         out["vol_today"]   = float(vol.iloc[-1])
         out["vol_ratio"]   = out["vol_today"] / avg_vol if avg_vol > 0 else np.nan
     return out
@@ -466,14 +569,20 @@ def scan_news(news: pd.DataFrame, days: int = 2) -> list[dict]:
     """Return recent headlines, with red-flag matches highlighted."""
     if news.empty:
         return []
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = datetime.now(ICT) - timedelta(days=days)
     out = []
     title_col = next((c for c in ("title", "name", "headline") if c in news.columns), None)
     if not title_col:
         return []
     for _, row in news.iterrows():
         pub = row.get("publish_date")
-        if pd.notna(pub) and pub.to_pydatetime() < cutoff:
+        if pd.notna(pub):
+            # Normalise to offset-aware for a safe comparison with `cutoff`.
+            pub_dt = pub.to_pydatetime()
+            if pub_dt.tzinfo is None:
+                pub_dt = pub_dt.replace(tzinfo=ICT)
+            if pub_dt < cutoff:
+                continue
             continue
         title = str(row.get(title_col, "")).strip()
         if not title:
@@ -719,7 +828,7 @@ def cmd_screen(args) -> int:
     df.to_csv(out_path, index=False)
     log.info("Screen saved → %s", out_path)
     cols = ["symbol", "last_price", "pe", "pb", "roe", "roa",
-            "eps_growth_3y", "mom_6m", "score"]
+            "net_margin", "mom_6m", "score"]
     cols = [c for c in cols if c in df.columns]
     print("\nTop 10 candidates by composite score:\n")
     print(df[cols].head(10).to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
