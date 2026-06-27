@@ -46,11 +46,9 @@ import pandas as pd
 # =============================================================================
 
 # Tickers you actively want to track in monitor mode.
-# Start with all VN30; trim down to your held / shortlisted names later.
+# Trimmed to Nam's actual portfolio (as of 2026-06).
 WATCHLIST: list[str] = [
-    "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG",
-    "MBB", "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB",
-    "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE",
+    "ACB", "BSR", "HDB", "HPG", "POW", "SSB", "SSI", "TCB", "VIB", "VPB",
 ]
 
 # Universe to screen in `screen` mode. Default = VN30; you can add candidates.
